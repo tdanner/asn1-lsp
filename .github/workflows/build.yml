@@ -60,11 +60,12 @@ jobs:
           cd dist
           ARCHIVE="${{ matrix.artifact }}.zip"
           python - <<'PY'
+          import os
           import zipfile
           from pathlib import Path
 
-          archive = Path("${ARCHIVE}")
-          binary = Path("${BINARY}")
+          archive = Path(os.environ["ARCHIVE"])
+          binary = Path(os.environ["BINARY"])
           with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zf:
               zf.write(binary, binary.name)
           PY
