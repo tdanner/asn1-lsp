@@ -1,0 +1,87 @@
+name: Build
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  release:
+    types:
+      - published
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build (${{ matrix.artifact }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact: asn1-lsp-linux-x86_64
+            binary: asn1-lsp
+          - os: macos-latest
+            artifact: asn1-lsp-macos-aarch64
+            binary: asn1-lsp
+          - os: windows-latest
+            artifact: asn1-lsp-windows-x86_64
+            binary: asn1-lsp.exe
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cargo fmt
+        run: cargo fmt --all --check
+
+      - name: Cargo clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Cargo test
+        run: cargo test --locked
+
+      - name: Cargo build (release)
+        run: cargo build --release --locked
+
+      - name: Prepare artifact
+        shell: bash
+        run: |
+          set -eo pipefail
+          mkdir -p dist
+          cp target/release/${{ matrix.binary }} dist/
+          cd dist
+          ARCHIVE="${{ matrix.artifact }}.zip"
+          python - <<'PY'
+          import zipfile
+          from pathlib import Path
+
+          archive = Path("${ARCHIVE}")
+          binary = Path("${BINARY}")
+          with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zf:
+              zf.write(binary, binary.name)
+          PY
+        env:
+          ARCHIVE: ${{ matrix.artifact }}.zip
+          BINARY: ${{ matrix.binary }}
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/${{ matrix.artifact }}.zip
+          if-no-files-found: error
+
+      - name: Publish release assets
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/${{ matrix.artifact }}.zip
+          fail_on_unmatched_files: true
