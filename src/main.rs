@@ -10,10 +10,18 @@ use tower_lsp::lsp_types::{
 use tower_lsp::{Client, LanguageServer, LspService, Server};
 use tree_sitter::{Language, Node, Parser};
 
+#[derive(Clone, Debug)]
+struct Definition {
+    name: String,
+    range: Range,
+}
+
 struct Backend {
     client: Client,
     language: Language,
     documents: tokio::sync::RwLock<HashMap<Url, String>>,
+    definitions: tokio::sync::RwLock<HashMap<Url, Vec<Definition>>>,
+    symbol_index: tokio::sync::RwLock<HashMap<String, Vec<Location>>>,
 }
 
 impl Backend {
@@ -22,6 +30,8 @@ impl Backend {
             client,
             language: tree_sitter_asn1::LANGUAGE.into(),
             documents: tokio::sync::RwLock::new(HashMap::new()),
+            definitions: tokio::sync::RwLock::new(HashMap::new()),
+            symbol_index: tokio::sync::RwLock::new(HashMap::new()),
         }
     }
 
@@ -45,36 +55,56 @@ impl Backend {
             return;
         }
 
-        let diagnostics = match parser.parse(&text, None) {
+        let (diagnostics, definitions) = match parser.parse(&text, None) {
             Some(tree) => {
-                if tree.root_node().has_error() {
+                let root = tree.root_node();
+                let definitions = Self::collect_definitions(root, &text);
+                let definition_count = definitions.len();
+
+                if root.has_error() {
                     self.client
                         .log_message(
                             MessageType::WARNING,
-                            format!("Parse errors detected in {}", uri),
+                            format!(
+                                "Parse errors detected in {} ({} definitions indexed)",
+                                uri, definition_count
+                            ),
                         )
                         .await;
-                    Self::error_diagnostics(tree.root_node())
+                    (Self::error_diagnostics(root), definitions)
                 } else {
                     self.client
-                        .log_message(MessageType::INFO, format!("Parsed {}", uri.path()))
+                        .log_message(
+                            MessageType::INFO,
+                            format!(
+                                "Parsed {} with {} definitions",
+                                uri.path(),
+                                definition_count
+                            ),
+                        )
                         .await;
-                    Vec::new()
+                    (Vec::new(), definitions)
                 }
             }
-            None => {
+            None => (
                 vec![Diagnostic {
                     range: Range::default(),
                     severity: Some(DiagnosticSeverity::ERROR),
                     message: "Failed to parse document".to_string(),
                     ..Default::default()
-                }]
-            }
+                }],
+                Vec::new(),
+            ),
         };
 
         self.client
             .publish_diagnostics(uri.clone(), diagnostics, None)
             .await;
+        self.update_symbol_index(uri, &definitions).await;
+        self.definitions
+            .write()
+            .await
+            .insert(uri.clone(), definitions);
     }
 
     fn error_diagnostics(root: Node) -> Vec<Diagnostic> {
@@ -124,6 +154,84 @@ impl Backend {
         }
 
         diagnostics
+    }
+
+    fn collect_definitions(root: Node, source: &str) -> Vec<Definition> {
+        const DEFINITION_KINDS: &[&str] = &[
+            "module_identity_assignment",
+            "module_compliance_assignment",
+            "object_group_assignment",
+            "notification_group_assignment",
+            "agent_capabilities_assignment",
+            "object_identity_assignment",
+            "object_identifier_assignment",
+            "object_type_assignment",
+            "notification_type_assignment",
+            "trap_type_assignment",
+            "textual_convention_definition",
+            "type_assignment",
+        ];
+
+        let mut definitions = Vec::new();
+        let mut stack = vec![root];
+
+        while let Some(node) = stack.pop() {
+            if DEFINITION_KINDS.iter().any(|kind| node.kind() == *kind) {
+                if let Some(name_node) = node.named_child(0) {
+                    let start = name_node.start_byte();
+                    let end = name_node.end_byte();
+                    if end <= source.len() {
+                        let name = source[start..end].to_string();
+                        definitions.push(Definition {
+                            name,
+                            range: Range {
+                                start: Position {
+                                    line: name_node.start_position().row as u32,
+                                    character: name_node.start_position().column as u32,
+                                },
+                                end: Position {
+                                    line: name_node.end_position().row as u32,
+                                    character: name_node.end_position().column as u32,
+                                },
+                            },
+                        });
+                    }
+                }
+
+                continue;
+            }
+
+            let mut cursor = node.walk();
+            if cursor.goto_first_child() {
+                loop {
+                    stack.push(cursor.node());
+                    if !cursor.goto_next_sibling() {
+                        break;
+                    }
+                }
+            }
+        }
+
+        definitions
+    }
+
+    async fn update_symbol_index(&self, uri: &Url, definitions: &[Definition]) {
+        let mut index = self.symbol_index.write().await;
+
+        for locations in index.values_mut() {
+            locations.retain(|location| location.uri != *uri);
+        }
+        index.retain(|_, locations| !locations.is_empty());
+
+        for definition in definitions {
+            index
+                .entry(definition.name.clone())
+                .or_default()
+                .push(Location {
+                    uri: uri.clone(),
+                    range: definition.range.clone(),
+                });
+        }
     }
 }
 
@@ -193,6 +301,8 @@ impl LanguageServer for Backend {
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         let uri = params.text_document.uri;
         self.documents.write().await.remove(&uri);
+        self.definitions.write().await.remove(&uri);
+        self.update_symbol_index(&uri, &[]).await;
         self.client.publish_diagnostics(uri, Vec::new(), None).await;
     }
 
