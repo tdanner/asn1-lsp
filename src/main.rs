@@ -229,7 +229,7 @@ impl Backend {
                 .or_default()
                 .push(Location {
                     uri: uri.clone(),
-                    range: definition.range.clone(),
+                    range: definition.range,
                 });
         }
     }
@@ -308,7 +308,6 @@ impl LanguageServer for Backend {
                 name: "asn1-lsp".to_string(),
                 version: None,
             }),
-            ..Default::default()
         })
     }
 
