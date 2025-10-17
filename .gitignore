@@ -1,0 +1,12 @@
+# Build outputs
+/target/
+
+# Direnv
+/.direnv/
+
+# Nix build artifacts
+/result
+/result-bin
+
+# macOS noise
+.DS_Store
