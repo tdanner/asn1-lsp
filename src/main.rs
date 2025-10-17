@@ -233,6 +233,55 @@ impl Backend {
                 });
         }
     }
+
+    fn symbol_at_position(text: &str, position: Position) -> Option<String> {
+        let line_index = position.line as usize;
+        let character_index = position.character as usize;
+        let line = text.split('\n').nth(line_index)?;
+
+        let line_char_count = line.chars().count();
+        if character_index > line_char_count {
+            return None;
+        }
+
+        let byte_index = Self::byte_index_at(line, character_index)?;
+        let mut start = byte_index;
+        let mut end = byte_index;
+        let bytes = line.as_bytes();
+
+        while start > 0 && Self::is_symbol_byte(bytes[start - 1]) {
+            start -= 1;
+        }
+
+        while end < bytes.len() && Self::is_symbol_byte(bytes[end]) {
+            end += 1;
+        }
+
+        if start == end {
+            return None;
+        }
+
+        Some(line[start..end].to_string())
+    }
+
+    fn byte_index_at(line: &str, character_index: usize) -> Option<usize> {
+        let char_count = line.chars().count();
+        if character_index > char_count {
+            return None;
+        }
+
+        if character_index == char_count {
+            Some(line.len())
+        } else {
+            line.char_indices()
+                .nth(character_index)
+                .map(|(byte_index, _)| byte_index)
+        }
+    }
+
+    fn is_symbol_byte(byte: u8) -> bool {
+        byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-'
+    }
 }
 
 #[tower_lsp::async_trait]
@@ -308,10 +357,33 @@ impl LanguageServer for Backend {
 
     async fn goto_definition(
         &self,
-        _: GotoDefinitionParams,
+        params: GotoDefinitionParams,
     ) -> Result<Option<GotoDefinitionResponse>> {
-        // TODO: Parse the syntax tree and resolve ASN.1 symbol definitions.
-        Ok(None)
+        let text_document_position = params.text_document_position_params;
+        let uri = text_document_position.text_document.uri;
+        let position = text_document_position.position;
+
+        let symbol = {
+            let documents = self.documents.read().await;
+            documents
+                .get(&uri)
+                .and_then(|text| Self::symbol_at_position(text, position))
+        };
+
+        let Some(symbol) = symbol else {
+            return Ok(None);
+        };
+
+        let locations = {
+            let index = self.symbol_index.read().await;
+            index.get(&symbol).cloned().unwrap_or_default()
+        };
+
+        if locations.is_empty() {
+            return Ok(None);
+        }
+
+        Ok(Some(GotoDefinitionResponse::Array(locations)))
     }
 
     async fn references(&self, _: ReferenceParams) -> Result<Option<Vec<Location>>> {
