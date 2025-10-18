@@ -471,8 +471,8 @@ fn push_token_for_node(
 ) {
     let start_position = node.start_position();
     let end_position = node.end_position();
-    let start_line = start_position.row as usize;
-    let end_line = end_position.row as usize;
+    let start_line = start_position.row;
+    let end_line = end_position.row;
     let start_byte = node.start_byte();
     let end_byte = node.end_byte();
 
