@@ -1,10 +1,12 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::{
     Diagnostic, DiagnosticSeverity, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
     DidOpenTextDocumentParams, GotoDefinitionParams, GotoDefinitionResponse, InitializeParams,
     InitializeResult, InitializedParams, Location, MessageType, OneOf, Position, Range,
-    ReferenceParams, ServerCapabilities, ServerInfo, TextDocumentSyncCapability,
+    ReferenceParams, SemanticToken, SemanticTokenType, SemanticTokens, SemanticTokensFullOptions,
+    SemanticTokensLegend, SemanticTokensOptions, SemanticTokensParams, SemanticTokensResult,
+    SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo, TextDocumentSyncCapability,
     TextDocumentSyncKind, TextDocumentSyncOptions, Url,
 };
 use tower_lsp::{Client, LanguageServer, LspService, Server};
@@ -14,6 +16,8 @@ use tree_sitter::{Language, Node, Parser};
 struct Definition {
     name: String,
     range: Range,
+    start_byte: usize,
+    end_byte: usize,
 }
 
 struct Backend {
@@ -194,6 +198,8 @@ impl Backend {
                                     character: name_node.end_position().column as u32,
                                 },
                             },
+                            start_byte: start,
+                            end_byte: end,
                         });
                     }
                 }
@@ -282,6 +288,354 @@ impl Backend {
     fn is_symbol_byte(byte: u8) -> bool {
         byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-'
     }
+
+    async fn semantic_tokens_data(&self, uri: &Url) -> Option<Vec<SemanticToken>> {
+        let text = {
+            let documents = self.documents.read().await;
+            documents.get(uri)?.clone()
+        };
+
+        let mut parser = Parser::new();
+        if parser.set_language(&self.language).is_err() {
+            self.client
+                .log_message(
+                    MessageType::ERROR,
+                    "Failed to load ASN.1 grammar for semantic tokens".to_string(),
+                )
+                .await;
+            return None;
+        }
+
+        let tree = parser.parse(&text, None)?;
+        let root = tree.root_node();
+        let definitions = Self::collect_definitions(root, &text);
+        let definition_spans: HashSet<(usize, usize)> = definitions
+            .iter()
+            .map(|d| (d.start_byte, d.end_byte))
+            .collect();
+
+        Some(Self::collect_semantic_tokens(
+            &text,
+            root,
+            &definition_spans,
+        ))
+    }
+}
+
+const SEMANTIC_TOKEN_TYPES: &[SemanticTokenType] = &[
+    SemanticTokenType::COMMENT,
+    SemanticTokenType::STRING,
+    SemanticTokenType::NUMBER,
+    SemanticTokenType::NAMESPACE,
+    SemanticTokenType::TYPE,
+    SemanticTokenType::VARIABLE,
+    SemanticTokenType::MACRO,
+    SemanticTokenType::KEYWORD,
+];
+
+#[derive(Clone, Copy)]
+enum SemanticKind {
+    Comment,
+    String,
+    Number,
+    Namespace,
+    Type,
+    Variable,
+    Macro,
+    Keyword,
+}
+
+impl SemanticKind {
+    const fn index(self) -> u32 {
+        match self {
+            SemanticKind::Comment => 0,
+            SemanticKind::String => 1,
+            SemanticKind::Number => 2,
+            SemanticKind::Namespace => 3,
+            SemanticKind::Type => 4,
+            SemanticKind::Variable => 5,
+            SemanticKind::Macro => 6,
+            SemanticKind::Keyword => 7,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct SemanticTokenData {
+    line: u32,
+    start_char: u32,
+    length: u32,
+    token_type: u32,
+    modifiers: u32,
+}
+
+impl Backend {
+    fn collect_semantic_tokens(
+        text: &str,
+        root: Node,
+        definition_spans: &HashSet<(usize, usize)>,
+    ) -> Vec<SemanticToken> {
+        let mut tokens = Vec::new();
+        let line_offsets = line_start_offsets(text);
+        let mut stack = vec![root];
+
+        while let Some(node) = stack.pop() {
+            Self::push_semantic_token(&mut tokens, node, text, &line_offsets, definition_spans);
+
+            let mut cursor = node.walk();
+            if cursor.goto_first_child() {
+                loop {
+                    stack.push(cursor.node());
+                    if !cursor.goto_next_sibling() {
+                        break;
+                    }
+                }
+            }
+        }
+
+        tokens.sort_by(|a, b| match a.line.cmp(&b.line) {
+            std::cmp::Ordering::Equal => a.start_char.cmp(&b.start_char),
+            other => other,
+        });
+
+        encode_semantic_tokens(tokens)
+    }
+
+    fn push_semantic_token(
+        tokens: &mut Vec<SemanticTokenData>,
+        node: Node,
+        text: &str,
+        line_offsets: &[usize],
+        definition_spans: &HashSet<(usize, usize)>,
+    ) {
+        let kind = match node.kind() {
+            "comment" => Some(SemanticKind::Comment),
+            "string" | "hex_string" | "binary_string" => Some(SemanticKind::String),
+            "number" => Some(SemanticKind::Number),
+            "module_identifier" => Some(SemanticKind::Namespace),
+            "identifier" => Some(SemanticKind::Type),
+            "symbol" => {
+                let span = (node.start_byte(), node.end_byte());
+                if definition_spans.contains(&span) {
+                    Some(SemanticKind::Macro)
+                } else {
+                    Some(SemanticKind::Variable)
+                }
+            }
+            other if is_keyword(other) => Some(SemanticKind::Keyword),
+            _ => None,
+        };
+
+        let Some(kind) = kind else {
+            return;
+        };
+
+        push_token_for_node(tokens, node, text, line_offsets, kind);
+    }
+}
+
+fn encode_semantic_tokens(tokens: Vec<SemanticTokenData>) -> Vec<SemanticToken> {
+    let mut data = Vec::with_capacity(tokens.len());
+    let mut prev_line = 0;
+    let mut prev_start = 0;
+
+    for token in tokens {
+        let delta_line = token.line.saturating_sub(prev_line);
+        let delta_start = if delta_line == 0 {
+            token.start_char.saturating_sub(prev_start)
+        } else {
+            token.start_char
+        };
+
+        data.push(SemanticToken {
+            delta_line,
+            delta_start,
+            length: token.length,
+            token_type: token.token_type,
+            token_modifiers_bitset: token.modifiers,
+        });
+
+        prev_line = token.line;
+        prev_start = token.start_char;
+    }
+
+    data
+}
+
+fn push_token_for_node(
+    tokens: &mut Vec<SemanticTokenData>,
+    node: Node,
+    text: &str,
+    line_offsets: &[usize],
+    kind: SemanticKind,
+) {
+    let start_position = node.start_position();
+    let end_position = node.end_position();
+    let start_line = start_position.row;
+    let end_line = end_position.row;
+    let start_byte = node.start_byte();
+    let end_byte = node.end_byte();
+
+    if start_line == end_line {
+        push_single_line_token(
+            tokens,
+            text,
+            line_offsets,
+            start_line,
+            start_byte,
+            end_byte,
+            kind,
+        );
+    } else {
+        for line in start_line..=end_line {
+            let line_start = line_offsets.get(line).copied().unwrap_or(0);
+            let line_end = line_end_offset(text, line_offsets, line);
+            let token_start = if line == start_line {
+                start_byte
+            } else {
+                line_start
+            };
+            let token_end = if line == end_line {
+                end_byte
+            } else {
+                line_end.min(end_byte)
+            };
+
+            if token_start >= token_end {
+                continue;
+            }
+
+            push_single_line_token(
+                tokens,
+                text,
+                line_offsets,
+                line,
+                token_start,
+                token_end,
+                kind,
+            );
+        }
+    }
+}
+
+fn push_single_line_token(
+    tokens: &mut Vec<SemanticTokenData>,
+    text: &str,
+    line_offsets: &[usize],
+    line: usize,
+    start_byte: usize,
+    end_byte: usize,
+    kind: SemanticKind,
+) {
+    let line_start = line_offsets.get(line).copied().unwrap_or(0);
+    let start_slice = &text[line_start..start_byte];
+    let token_slice = &text[start_byte..end_byte];
+    let start_char = utf16_len(start_slice);
+    let length = utf16_len(token_slice);
+
+    if length == 0 {
+        return;
+    }
+
+    tokens.push(SemanticTokenData {
+        line: line as u32,
+        start_char,
+        length,
+        token_type: kind.index(),
+        modifiers: 0,
+    });
+}
+
+fn line_start_offsets(text: &str) -> Vec<usize> {
+    let mut offsets = vec![0];
+    for (idx, ch) in text.char_indices() {
+        if ch == '\n' {
+            offsets.push(idx + ch.len_utf8());
+        }
+    }
+    offsets
+}
+
+fn line_end_offset(text: &str, offsets: &[usize], line: usize) -> usize {
+    let start = offsets.get(line).copied().unwrap_or(0);
+    let end = if let Some(next) = offsets.get(line + 1).copied() {
+        next
+    } else {
+        text.len()
+    };
+
+    let mut trimmed_end = end;
+    while trimmed_end > start {
+        let ch = text.as_bytes()[trimmed_end - 1];
+        if ch == b'\n' || ch == b'\r' {
+            trimmed_end -= 1;
+        } else {
+            break;
+        }
+    }
+
+    trimmed_end
+}
+
+fn utf16_len(text: &str) -> u32 {
+    text.encode_utf16().count() as u32
+}
+
+fn is_keyword(kind: &str) -> bool {
+    matches!(
+        kind,
+        "ACCESS"
+            | "AGENT-CAPABILITIES"
+            | "ALL"
+            | "AUGMENTS"
+            | "BEGIN"
+            | "BITS"
+            | "CONTACT-INFO"
+            | "DEFINITIONS"
+            | "DEFVAL"
+            | "DESCRIPTION"
+            | "DISPLAY-HINT"
+            | "END"
+            | "ENTERPRISE"
+            | "EXPORTS"
+            | "FROM"
+            | "GROUP"
+            | "IMPLIED"
+            | "IMPORTS"
+            | "INCLUDES"
+            | "INDEX"
+            | "INTEGER"
+            | "LAST-UPDATED"
+            | "MANDATORY-GROUPS"
+            | "MAX-ACCESS"
+            | "MIN-ACCESS"
+            | "MODULE"
+            | "MODULE-COMPLIANCE"
+            | "MODULE-IDENTITY"
+            | "NOTIFICATION-GROUP"
+            | "NOTIFICATION-TYPE"
+            | "NOTIFICATIONS"
+            | "OBJECT"
+            | "OBJECT-GROUP"
+            | "OBJECT-IDENTITY"
+            | "OBJECT-TYPE"
+            | "OBJECTS"
+            | "OF"
+            | "ORGANIZATION"
+            | "PRODUCT-RELEASE"
+            | "REFERENCE"
+            | "REVISION"
+            | "SEQUENCE"
+            | "STATUS"
+            | "SUPPORTS"
+            | "SYNTAX"
+            | "TEXTUAL-CONVENTION"
+            | "TRAP-TYPE"
+            | "UNITS"
+            | "VARIABLES"
+            | "VARIATION"
+            | "WRITE-SYNTAX"
+    )
 }
 
 #[tower_lsp::async_trait]
@@ -302,6 +656,19 @@ impl LanguageServer for Backend {
                         ..Default::default()
                     },
                 )),
+                semantic_tokens_provider: Some(
+                    SemanticTokensServerCapabilities::SemanticTokensOptions(
+                        SemanticTokensOptions {
+                            work_done_progress_options: Default::default(),
+                            legend: SemanticTokensLegend {
+                                token_types: SEMANTIC_TOKEN_TYPES.to_vec(),
+                                token_modifiers: Vec::new(),
+                            },
+                            range: Some(false),
+                            full: Some(SemanticTokensFullOptions::Bool(true)),
+                        },
+                    ),
+                ),
                 ..Default::default()
             },
             server_info: Some(ServerInfo {
@@ -388,6 +755,21 @@ impl LanguageServer for Backend {
     async fn references(&self, _: ReferenceParams) -> Result<Option<Vec<Location>>> {
         // TODO: Track symbol usages across the workspace.
         Ok(None)
+    }
+
+    async fn semantic_tokens_full(
+        &self,
+        params: SemanticTokensParams,
+    ) -> Result<Option<SemanticTokensResult>> {
+        let uri = params.text_document.uri;
+        let data = self.semantic_tokens_data(&uri).await;
+
+        Ok(data.map(|data| {
+            SemanticTokensResult::Tokens(SemanticTokens {
+                result_id: None,
+                data,
+            })
+        }))
     }
 }
 
